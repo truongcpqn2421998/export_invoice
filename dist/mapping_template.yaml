@@ -1,0 +1,29 @@
+# Mapping from source field names (as extracted from XML) to target column names
+# This file is optional: the app already includes built-in default mappings.
+# Use this file only if you need to override or add your own custom field names.
+# Example:
+# ThTien: Amount
+# DGia: UnitPrice
+# SLuong: Quantity
+
+field_mappings:
+  ThTien: Amount
+  ThanhTien: Amount
+  DGia: UnitPrice
+  SLuong: Quantity
+  MHHDVu: Code
+  THHDVu: Description
+  DVTinh: Unit
+  STT: LineNo
+  TSuat: TaxRate
+  ThueSuat: TaxRate
+  TienThue: TaxAmount
+  CKhau: DiscountAmount
+  TongTien: TotalAmount
+  TgTTTBSo: TotalAmountNumber
+  TgTTTBChu: TotalAmountWords
+  TgThue: TotalTaxAmount
+  TgTT: TotalBeforeTax
+  MaDiaDiemKD: BusinessLocationCode
+  NguoiLap: IssuerName
+  NguoiKy: SignerName
