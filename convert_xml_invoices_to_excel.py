@@ -2,6 +2,8 @@ import os
 import glob
 import xml.etree.ElementTree as ET
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 DEFAULT_FIELD_MAPPINGS = {
     'STT': 'LineNo',
@@ -85,10 +87,14 @@ def normalize_item(h):
             item['Amount'] = val
         elif tag in ('tsuat', 'thuesuat', 'taxrate'):
             item['TaxRate'] = val
+        elif tag in ('tlckhau', 'discountrate', 'discountpercent'):
+            item['DiscountRate'] = val
         elif tag in ('tienthue', 'taxamount'):
             item['TaxAmount'] = val
         elif tag in ('ckhau', 'discountamount', 'discount'):
             item['DiscountAmount'] = val
+        elif tag in ('tlckhau', 'discountrate', 'discountpercent'):
+            item['DiscountRate'] = val
         elif tag == 'ttkhac':
             # parse inner TTKhac/TTin structures
             extra = extract_ttkhac(c)
@@ -126,6 +132,7 @@ def normalize_item(h):
     get_if_missing('TaxRate', ['TSuat', 'ThueSuat', 'TaxRate'])
     get_if_missing('TaxAmount', ['TienThue', 'TaxAmount'])
     get_if_missing('DiscountAmount', ['CKhau', 'DiscountAmount', 'Discount'])
+    get_if_missing('DiscountRate', ['TLCKhau', 'DiscountRate'])
 
     # ensure keys exist
     for k in ('LineNo', 'Code', 'Description', 'Unit', 'Quantity', 'UnitPrice', 'Amount'):
@@ -211,6 +218,59 @@ def parse_invoice(path):
     return header, items
 
 
+def convert_numeric(val, is_percentage=False):
+    """Convert value to float, return 0 if fails. Handle percentage format."""
+    if not val:
+        return 0
+    try:
+        val_str = str(val).strip()
+        # If it's percentage format like "8%", extract number and divide by 100
+        if '%' in val_str:
+            num = float(val_str.replace('%', '').replace(',', '.').strip())
+            return num / 100
+        else:
+            num = float(val_str.replace(',', '.'))
+            # If is_percentage flag, assume raw number is percentage (12.8 = 12.8%)
+            if is_percentage and num > 0:
+                return num / 100
+            return num
+    except Exception:
+        return 0
+
+
+def calculate_item_columns(row):
+    """Calculate computed columns based on the formulas"""
+    qty = convert_numeric(row.get('Quantity', 0))
+    unit_price = convert_numeric(row.get('UnitPrice', 0))
+    discount_rate = convert_numeric(row.get('DiscountRate', 0), is_percentage=True)
+    tax_rate = convert_numeric(row.get('TaxRate', 0), is_percentage=True)
+    
+    # Amount before discount = Quantity * UnitPrice
+    amount_before_discount = qty * unit_price
+    
+    # DiscountAmount = Amount before discount * DiscountRate
+    discount_amount = amount_before_discount * discount_rate
+    
+    # Amount after discount
+    amount_after_discount = amount_before_discount - discount_amount
+    
+    # VATAmount = (Amount after discount) * TaxRate
+    vat_amount = amount_after_discount * tax_rate
+    
+    # Total payment = Amount after discount + VATAmount
+    total_payment = amount_after_discount + vat_amount
+    
+    return {
+        'Amount before discount': amount_before_discount,
+        'DiscountRate': discount_rate,
+        'DiscountAmount': discount_amount,
+        'Amount after discount': amount_after_discount,
+        'TaxRate': tax_rate,
+        'VATAmount': vat_amount,
+        'Total payment': total_payment,
+    }
+
+
 def convert_dir_to_excels(input_dir, output_dir=None, mapping_path=None):
     if output_dir is None:
         output_dir = input_dir
@@ -236,49 +296,149 @@ def convert_dir_to_excels(input_dir, output_dir=None, mapping_path=None):
 
     all_headers = []
     all_items = []
+    
+    # Define column order for invoices_items
+    header_columns = [
+        'InvoiceNumber', 'InvoiceSeries', 'IssueDate', 'InvoiceType', 
+        'BusinessLocationCode', 'PaymentMethod', 'Currency', 
+        'OriginalInvoiceCode', 'OriginalInvoiceNumber', 'AdjustmentReason',
+        'SellerName', 'SellerTaxCode', 'SellerAddress', 'SellerPhone', 'SellerEmail',
+        'BuyerName', 'BuyerTaxCode', 'BuyerAddress', 'BuyerPhone', 'BuyerEmail',
+        'TotalBeforeTax', 'TotalTaxAmount', 'TotalAmountNumber', 'TotalAmountWords'
+    ]
+    
+    item_columns = [
+        'Code', 'Description', 'Unit', 'Quantity', 'UnitPrice',
+        'DiscountRate', 'TaxRate'
+    ]
+    
+    computed_columns = [
+        'Amount before discount', 'DiscountAmount',
+        'Amount after discount', 'VATAmount', 'Total payment'
+    ]
+    
+    all_columns = header_columns + item_columns + computed_columns
 
     for f in xml_files:
         header, items = parse_invoice(f)
-        base = os.path.splitext(os.path.basename(f))[0]
-        out_path = os.path.join(output_dir, base + '.xlsx')
-
-        # header dataframe (as two-column table)
-        header_df = pd.DataFrame(list(header.items()), columns=['Field', 'Value'])
-        items_df = pd.DataFrame(items)
-
-        # apply simple column renaming from mapping if provided
-        if mappings and not items_df.empty:
-            try:
-                items_df = items_df.rename(columns=mappings)
-            except Exception:
-                pass
-
-        # write per-invoice file
-        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-            header_df.to_excel(writer, sheet_name='invoice_header', index=False)
-            items_df.to_excel(writer, sheet_name='invoice_items', index=False)
-
-        print('Wrote', out_path)
-
+        
         # accumulate for combined file
-        hdr_row = header.copy()
-        all_headers.append(hdr_row)
-        for it in items:
-            row = hdr_row.copy()
-            # map item keys if mapping provided
-            for k, v in it.items():
+        for item in items:
+            row = {}
+            
+            # Initialize all columns with empty values
+            for col in all_columns:
+                row[col] = ''
+            
+            # Fill header columns
+            for col in header_columns:
+                row[col] = header.get(col, '')
+            
+            # Fill item columns (from item data, not computed yet)
+            for k, v in item.items():
                 target_k = mappings.get(k, k)
-                row[target_k] = v
+                if target_k in item_columns:
+                    row[target_k] = v
+            
             all_items.append(row)
+        
+        # accumulate headers (one per invoice)
+        all_headers.append(header)
 
     # write combined workbook
     combined_path = os.path.join(output_dir, 'all_invoices.xlsx')
     if all_headers or all_items:
+        wb = Workbook()
+        
+        # Write invoices_summary sheet
+        ws_summary = wb.active
+        ws_summary.title = 'invoices_summary'
         headers_df = pd.DataFrame(all_headers)
-        items_df = pd.DataFrame(all_items)
-        with pd.ExcelWriter(combined_path, engine='openpyxl') as writer:
-            headers_df.to_excel(writer, sheet_name='invoices_summary', index=False)
-            items_df.to_excel(writer, sheet_name='invoices_items', index=False)
+        for r_idx, row in enumerate(headers_df.values, 1):
+            for c_idx, value in enumerate(row, 1):
+                ws_summary.cell(row=r_idx, column=c_idx, value=value)
+        # Add header row
+        for c_idx, col_name in enumerate(headers_df.columns, 1):
+            ws_summary.cell(row=1, column=c_idx, value=col_name)
+        
+        # Write invoices_items sheet with formulas
+        ws_items = wb.create_sheet('invoices_items')
+        
+        # Write header row
+        for c_idx, col_name in enumerate(all_columns, 1):
+            ws_items.cell(row=1, column=c_idx, value=col_name)
+        
+        # Column indices for formulas
+        col_idx_map = {col: idx for idx, col in enumerate(all_columns, 1)}
+        qty_col = get_column_letter(col_idx_map['Quantity'])
+        unit_price_col = get_column_letter(col_idx_map['UnitPrice'])
+        discount_rate_col = get_column_letter(col_idx_map['DiscountRate'])
+        tax_rate_col = get_column_letter(col_idx_map['TaxRate'])
+        amount_before_disc_col = get_column_letter(col_idx_map['Amount before discount'])
+        discount_amt_col = get_column_letter(col_idx_map['DiscountAmount'])
+        amount_after_disc_col = get_column_letter(col_idx_map['Amount after discount'])
+        vat_col = get_column_letter(col_idx_map['VATAmount'])
+        
+        # Write data rows with formulas
+        for row_idx, item in enumerate(all_items, 2):
+            for c_idx, col_name in enumerate(all_columns, 1):
+                if col_name == 'Amount before discount':
+                    # Formula: Quantity * UnitPrice
+                    ws_items.cell(row=row_idx, column=c_idx, value=f'={qty_col}{row_idx}*{unit_price_col}{row_idx}')
+                elif col_name == 'DiscountAmount':
+                    # Formula: Amount before discount * DiscountRate
+                    ws_items.cell(row=row_idx, column=c_idx, value=f'={amount_before_disc_col}{row_idx}*{discount_rate_col}{row_idx}')
+                elif col_name == 'Amount after discount':
+                    # Formula: Amount before discount - DiscountAmount
+                    ws_items.cell(row=row_idx, column=c_idx, value=f'={amount_before_disc_col}{row_idx}-{discount_amt_col}{row_idx}')
+                elif col_name == 'VATAmount':
+                    # Formula: Amount after discount * TaxRate
+                    ws_items.cell(row=row_idx, column=c_idx, value=f'={amount_after_disc_col}{row_idx}*{tax_rate_col}{row_idx}')
+                elif col_name == 'Total payment':
+                    # Formula: Amount after discount + VATAmount
+                    ws_items.cell(row=row_idx, column=c_idx, value=f'={amount_after_disc_col}{row_idx}+{vat_col}{row_idx}')
+                elif col_name in ('Quantity', 'UnitPrice'):
+                    # Convert to float for numeric calculations
+                    val = item.get(col_name, '')
+                    if val:
+                        try:
+                            ws_items.cell(row=row_idx, column=c_idx, value=convert_numeric(val))
+                        except Exception:
+                            ws_items.cell(row=row_idx, column=c_idx, value=val)
+                    else:
+                        ws_items.cell(row=row_idx, column=c_idx, value=0)
+                elif col_name == 'DiscountRate':
+                    # Format as percentage: convert to float and format
+                    val = item.get(col_name, '')
+                    if val:
+                        try:
+                            num_val = convert_numeric(val, is_percentage=True)
+                            cell = ws_items.cell(row=row_idx, column=c_idx, value=num_val)
+                            # Format as percentage
+                            from openpyxl.styles import numbers
+                            cell.number_format = '0.00%'
+                        except Exception:
+                            ws_items.cell(row=row_idx, column=c_idx, value=0)
+                    else:
+                        ws_items.cell(row=row_idx, column=c_idx, value=0)
+                elif col_name == 'TaxRate':
+                    # Convert to numeric format but display as percentage
+                    val = item.get(col_name, '')
+                    if val:
+                        try:
+                            num_val = convert_numeric(val, is_percentage=True)
+                            cell = ws_items.cell(row=row_idx, column=c_idx, value=num_val)
+                            # Format as percentage
+                            from openpyxl.styles import numbers
+                            cell.number_format = '0.00%'
+                        except Exception:
+                            ws_items.cell(row=row_idx, column=c_idx, value=val)
+                    else:
+                        ws_items.cell(row=row_idx, column=c_idx, value='')
+                else:
+                    ws_items.cell(row=row_idx, column=c_idx, value=item.get(col_name, ''))
+        
+        wb.save(combined_path)
         print('Wrote combined', combined_path)
 
 
